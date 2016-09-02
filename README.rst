@@ -2,6 +2,9 @@
 click-repl
 ==========
 
+.. image:: https://travis-ci.org/click-contrib/click-repl.svg?branch=master
+    :target: https://travis-ci.org/click-contrib/click-repl
+
 **This is experimental, which is why it's not on PyPI**
 
 In your click_ app::
@@ -28,6 +31,7 @@ In the shell::
     $ echo hello | my_app repl
     Hello world!
 
+
 Features not shown:
 
 * Tab-completion.
@@ -35,6 +39,8 @@ Features not shown:
   subcommands. If you're keeping caches on that object (like I do), using the
   app's repl instead of the shell is a huge performance win.
 * ``!``-prefix executes shell commands.
+
+You can use the internal ``:help`` command to explain usage.
 
 .. _click: http://click.pocoo.org/
 

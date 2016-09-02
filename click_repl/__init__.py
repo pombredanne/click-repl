@@ -1,19 +1,79 @@
+from collections import defaultdict
 from prompt_toolkit.completion import Completer, Completion
-from prompt_toolkit.history import History
-from prompt_toolkit.shortcuts import get_input
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.shortcuts import prompt
 import click
 import click._bashcomplete
 import click.parser
 import os
 import shlex
 import sys
+import six
+from .exceptions import InternalCommandException, ExitReplException  # noqa
+
+_internal_commands = dict()
+
+
+def _register_internal_command(names, target, description=None):
+    if not hasattr(target, '__call__'):
+        raise ValueError('Internal command must be a callable')
+
+    if isinstance(names, six.string_types):
+        names = [names]
+    elif not isinstance(names, (list, tuple)):
+        raise ValueError('"names" must be a string or a list / tuple')
+
+    for name in names:
+        _internal_commands[name] = (target, description)
+
+
+def _get_registered_target(name, default=None):
+    target_info = _internal_commands.get(name)
+    if target_info:
+        return target_info[0]
+    return default
+
+
+def _exit_internal():
+    raise ExitReplException()
+
+
+def _help_internal():
+    formatter = click.HelpFormatter()
+    formatter.write_heading('REPL help')
+    formatter.indent()
+    with formatter.section('External Commands'):
+        formatter.write_text('prefix external commands with "!"')
+    with formatter.section('Internal Commands'):
+        formatter.write_text('prefix internal commands with ":"')
+        info_table = defaultdict(list)
+        for mnemonic, target_info in six.iteritems(_internal_commands):
+            info_table[target_info[1]].append(mnemonic)
+        formatter.write_dl(
+            (', '.join((':{0}'.format(mnemonic)
+                        for mnemonic in sorted(mnemonics))), description)
+            for description, mnemonics in six.iteritems(info_table)
+        )
+    return formatter.getvalue()
+
+
+_register_internal_command(['q', 'quit', 'exit'], _exit_internal,
+                           'exits the repl')
+_register_internal_command(['?', 'h', 'help'], _help_internal,
+                           'displays general help information')
+
 
 class ClickCompleter(Completer):
     def __init__(self, cli):
         self.cli = cli
 
     def get_completions(self, document, complete_event):
+        # If ends in space, no completions are wished
+        if document.text_before_cursor.rstrip() != document.text_before_cursor:
+            return
+
         # Code analogous to click._bashcomplete.do_complete
+
         try:
             args = shlex.split(document.text_before_cursor)
         except ValueError:
@@ -49,59 +109,99 @@ class ClickCompleter(Completer):
                 yield item
 
 
-def register_repl(group, name='repl'):
-    @group.command(name=name)
-    @click.pass_context
-    def cli(old_ctx):
-        '''
-        Start an interactive shell. All subcommands are available in it.
+def repl(old_ctx, prompt_kwargs=None):
+    """
+    Start an interactive shell. All subcommands are available in it.
 
-        You can also pipe to this command to execute subcommands.
-        '''
+    :param old_ctx: The current Click context.
+    :param prompt_kwargs: Parameters passed to
+        :py:func:`prompt_toolkit.shortcuts.prompt`.
 
-        # parent should be available, but we're not going to bother if not
-        group_ctx = old_ctx.parent or old_ctx
-        isatty = sys.stdin.isatty()
-        if isatty:
-            history = History()
-            completer = ClickCompleter(group)
-            def get_command():
-                return get_input('> ', completer=completer, history=history)
-        else:
-            get_command = sys.stdin.readline
+    If stdin is not a TTY, no prompt will be printed, but only commands read
+    from stdin.
 
-        while True:
-            try:
-                command = get_command()
-            except KeyboardInterrupt:
+    """
+    # parent should be available, but we're not going to bother if not
+    group_ctx = old_ctx.parent or old_ctx
+    group = group_ctx.command
+    isatty = sys.stdin.isatty()
+
+    if isatty:
+        prompt_kwargs = prompt_kwargs or {}
+        prompt_kwargs.setdefault('message', u'> ')
+        history = prompt_kwargs.pop('history', None) \
+            or InMemoryHistory()
+        completer = prompt_kwargs.pop('completer', None) \
+            or ClickCompleter(group)
+
+        def get_command():
+            return prompt(completer=completer, history=history,
+                          **prompt_kwargs)
+    else:
+        get_command = sys.stdin.readline
+
+    while True:
+        try:
+            command = get_command()
+        except KeyboardInterrupt:
+            continue
+        except EOFError:
+            break
+
+        if not command:
+            if isatty:
                 continue
-            except EOFError:
+            else:
                 break
 
-            if not command:
-                if isatty:
-                    continue
-                else:
-                    break
+        if dispatch_repl_commands(command):
+            continue
 
-            if dispatch_repl_commands(command):
+        try:
+            result = handle_internal_commands(command)
+            if isinstance(result, six.string_types):
+                click.echo(result)
                 continue
+        except ExitReplException:
+            break
 
-            args = shlex.split(command)
+        args = shlex.split(command)
 
-            try:
-                with group.make_context(None, args, parent=group_ctx) as ctx:
-                    group.invoke(ctx)
-                    ctx.exit()
-            except click.ClickException as e:
-                e.show()
-            except SystemExit:
-                pass
+        try:
+            with group.make_context(None, args, parent=group_ctx) as ctx:
+                group.invoke(ctx)
+                ctx.exit()
+        except click.ClickException as e:
+            e.show()
+        except SystemExit:
+            pass
+
+
+def register_repl(group, name='repl'):
+    """Register :func:`repl()` as sub-command *name* of *group*."""
+    group.command(name=name)(click.pass_context(repl))
 
 
 def dispatch_repl_commands(command):
+    """Execute system commands entered in the repl.
+
+    System commands are all commands starting with "!".
+
+    """
     if command.startswith('!'):
         os.system(command[1:])
         return True
 
     return False
+
+
+def handle_internal_commands(command):
+    """Run repl-internal commands.
+
+    Repl-internal commands are all commands starting with ":".
+
+    """
+    if command.startswith(':'):
+        target = _get_registered_target(command[1:], default=None)
+        if target:
+            return target()
